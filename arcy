@@ -1,0 +1,447 @@
+#!/usr/bin/env bash
+# arcy — Rathole CLI with first-run setup (tcp/http/socks; no payload shown on run)
+set -euo pipefail
+
+# ==================== CONSTANTS/DEFAULTS ====================
+DEFAULT_SERVER="13.218.137.84"
+DEFAULT_SSH_USER="ubuntu"
+DEFAULT_CONTROL_PORT=2333
+DEFAULT_TOKEN=""                         # will be auto-generated if empty
+DEFAULT_SSH_KEY="${HOME}/.ssh/shell.pem" # used when AUTH_METHOD=key
+DEFAULT_NAME_PREFIX="dyn-"
+
+# Persistent home (requested): /home/.arcy ; fallback to $HOME/.arcy if not writable
+ARCY_HOME_DEFAULT="${HOME}/.arcy"
+ARCY_HOME="${ARCY_HOME:-$ARCY_HOME_DEFAULT}"
+CONFIG_FILE=""
+CFG_DIR=""        # per-port rathole client TOML files
+LOG_DIR=""        # client & spawned proxy logs
+PROXY_PID_DIR=""  # pidfiles for local proxies (gost)
+# ============================================================
+
+# ---------- UI helpers ----------
+supports_color(){ [[ -t 1 ]] && command -v tput >/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; }
+if supports_color; then
+  C_RESET="$(tput sgr0)"; C_DIM="$(tput dim)"; C_BOLD="$(tput bold)"
+  C_RED="$(tput setaf 1)"; C_GRN="$(tput setaf 2)"; C_YLW="$(tput setaf 3)"
+  C_BLU="$(tput setaf 4)"; C_MAG="$(tput setaf 5)"; C_CYN="$(tput setaf 6)"
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_MAG=""; C_CYN=""
+fi
+icon_ok="✓"; icon_fail="✗"; icon_info="ℹ"; icon_warn="!"
+case "$(locale charmap 2>/dev/null || echo ASCII)" in UTF-8) : ;; *) icon_ok="OK"; icon_fail="X"; icon_info="i"; icon_warn="!";; esac
+log_info(){ echo -e "${C_CYN}${icon_info}${C_RESET} $*"; }
+log_ok()  { echo -e "${C_GRN}${icon_ok}${C_RESET} $*"; }
+log_warn(){ echo -e "${C_YLW}${icon_warn}${C_RESET} $*"; }
+log_err(){ echo -e "${C_RED}${icon_fail}${C_RESET} $*" 1>&2; }
+hr(){ printf '%b\n' "${C_DIM}────────────────────────────────────────────${C_RESET}"; }
+box(){
+  local title="$1"; shift
+  local border="${C_DIM}┌──────────────────────────────────────────┐${C_RESET}"
+  local footer="${C_DIM}└──────────────────────────────────────────┘${C_RESET}"
+  echo -e "$border"
+  printf "${C_DIM}│${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$title"
+  while IFS= read -r line; do printf "${C_DIM}│${C_RESET} %s\n" "$line"; done <<< "${*:-}"
+  echo -e "$footer"
+}
+
+usage(){
+  cat <<USAGE
+${C_BOLD}arcy${C_RESET} — pretty CLI for dynamic Rathole tunnels
+
+${C_BOLD}Usage${C_RESET}
+  ${C_BLU}arcy tcp   <local_port> [remote_port] [-d]${C_RESET}                     open raw TCP tunnel
+  ${C_BLU}arcy http  <local_port> [remote_port] [-d] [--spawn] [--auth user:pass]${C_RESET}   expose HTTP proxy
+  ${C_BLU}arcy socks <local_port> [remote_port] [-d] [--spawn] [--auth user:pass]${C_RESET}   expose SOCKS5 proxy
+
+  ${C_BLU}arcy stop <remote_port>${C_RESET}                       stop local client only
+  ${C_BLU}arcy down <remote_port>${C_RESET}                       stop client + remove service on VPS
+  ${C_BLU}arcy ls${C_RESET}                                       list active dyn-* services on VPS
+  ${C_BLU}arcy status <remote_port>${C_RESET}                     show local/VPS status for a port
+  ${C_BLU}arcy logs${C_RESET}                                     tail Rathole server logs (VPS)
+  ${C_BLU}arcy logclear${C_RESET}                                 rotate+vacuum journal (VPS)
+
+  ${C_BLU}arcy setup${C_RESET}                                    (re)run interactive setup wizard
+  ${C_BLU}arcy print-config${C_RESET}                             show current config
+
+${C_BOLD}Examples${C_RESET}
+  arcy http  8080 443 -d --spawn --auth user:pass
+  arcy socks 1080 --spawn
+  arcy tcp   12345 4444
+USAGE
+}
+
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || { log_err "Missing: $1"; exit 1; }; }
+is_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
+trim(){ sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//'; }
+
+# ---------- Config bootstrap ----------
+init_dirs(){
+  # Try /home/.arcy first
+  if ! mkdir -p "$ARCY_HOME" 2>/dev/null; then
+    local alt="${HOME}/.arcy"
+    log_warn "Cannot write to ${ARCY_HOME}; falling back to ${alt}"
+    ARCY_HOME="$alt"
+    mkdir -p "$ARCY_HOME"
+  fi
+  CONFIG_FILE="${ARCY_HOME}/config.env"
+  CFG_DIR="${ARCY_HOME}/client"
+  LOG_DIR="${ARCY_HOME}/logs"
+  PROXY_PID_DIR="${ARCY_HOME}/run"
+  mkdir -p "$CFG_DIR" "$LOG_DIR" "$PROXY_PID_DIR"
+}
+
+random_token(){
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    # hexdump fallback
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'
+  fi
+}
+
+prompt(){
+  # args: var_name prompt_text default [secret_flag]
+  local __var="$1"; shift
+  local __text="$1"; shift
+  local __def="${1:-}"; shift || true
+  local __secret="${1:-0}"
+  local __inp=""
+  if [[ "$__secret" == "1" ]]; then
+    read -r -s -p "$(printf '%s [%s]: ' "$__text" "$__def")" __inp; echo
+  else
+    read -r -p "$(printf '%s [%s]: ' "$__text" "$__def")" __inp
+  fi
+  __inp="$(printf '%s' "${__inp:-$__def}" | trim)"
+  printf -v "$__var" '%s' "$__inp"
+}
+
+save_config(){
+  umask 077
+  cat > "$CONFIG_FILE" <<EOF
+# arcy persistent configuration (chmod 600)
+SERVER=${SERVER}
+SSH_USER=${SSH_USER}
+CONTROL_PORT=${CONTROL_PORT}
+TOKEN=${TOKEN}
+AUTH_METHOD=${AUTH_METHOD}        # key | password
+SSH_KEY=${SSH_KEY}
+NAME_PREFIX=${DEFAULT_NAME_PREFIX}
+EOF
+  chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+  log_ok "Config saved to ${CONFIG_FILE}"
+}
+
+load_config_if_any(){
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+}
+
+setup_wizard(){
+  hr
+  box "arcy — first-run setup" "This configuration will be saved at: ${CONFIG_FILE}"
+  local def_token="${DEFAULT_TOKEN}"
+  [[ -z "$def_token" ]] && def_token="$(random_token)"
+
+  prompt SERVER       "Server IP/Hostname" "${SERVER:-$DEFAULT_SERVER}"
+  prompt SSH_USER     "SSH user"           "${SSH_USER:-$DEFAULT_SSH_USER}"
+  while true; do
+    prompt CONTROL_PORT "Rathole control port" "${CONTROL_PORT:-$DEFAULT_CONTROL_PORT}"
+    is_port "${CONTROL_PORT}" && break || log_warn "Invalid port (1-65535)."
+  done
+
+  local am="${AUTH_METHOD:-key}"
+  read -r -p "Use SSH key auth? [Y/n] " yn
+  case "${yn:-Y}" in [Nn]*) am="password";; *) am="key";; esac
+  AUTH_METHOD="$am"
+
+  if [[ "$AUTH_METHOD" == "key" ]]; then
+    prompt SSH_KEY "SSH key path" "${SSH_KEY:-$DEFAULT_SSH_KEY}"
+  else
+    SSH_KEY=""  # not used; SSH will prompt for password interactively
+  fi
+
+  prompt TOKEN "Shared token (leave blank to auto-generate)" "${TOKEN:-$def_token}" 1
+
+  save_config
+}
+
+ensure_config(){
+  init_dirs
+  load_config_if_any
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    setup_wizard
+  fi
+  # Minimal sanity
+  : "${SERVER:?missing SERVER in config}"
+  : "${SSH_USER:?missing SSH_USER in config}"
+  : "${CONTROL_PORT:?missing CONTROL_PORT in config}"
+  : "${TOKEN:?missing TOKEN in config}"
+  : "${AUTH_METHOD:=key}"
+}
+
+# ---------- Build SSH options based on config ----------
+build_ssh_opts(){
+  local base="-o StrictHostKeyChecking=accept-new"
+  if [[ "${AUTH_METHOD}" == "key" ]]; then
+    local key="${SSH_KEY:-$DEFAULT_SSH_KEY}"
+    if [[ ! -f "$key" ]]; then
+      log_err "SSH key not found: ${key} (change via 'arcy setup')"; exit 1
+    fi
+    chmod 400 "$key" 2>/dev/null || true
+    SSH_OPTS="-i ${key} -o IdentitiesOnly=yes -o BatchMode=yes ${base}"
+  else
+    SSH_OPTS="-o BatchMode=no ${base}"
+  fi
+}
+
+# ---------- Shared helpers ----------
+cfg_path(){ echo "${CFG_DIR}/arcy_${1}.toml"; }
+client_pid_by_cfg(){ pgrep -f "$(cfg_path "$1")" || true; }
+ensure_service(){ ssh ${SSH_OPTS} "${SSH_USER}@${SERVER}" sudo /usr/local/bin/rh-add "${1}" >/dev/null; }
+remove_service(){ ssh ${SSH_OPTS} "${SSH_USER}@${SERVER}" sudo /usr/local/bin/rh-del "${1}" >/dev/null; }
+
+listening_local(){
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt 2>/dev/null | awk -v p="$1" '$4 ~ /127\.0\.0\.1:'"$1"'$/ {found=1} END{exit found?0:1}'
+  else
+    return 1
+  fi
+}
+
+spawn_proxy(){
+  # args: proto lport auth
+  local proto="$1" lport="$2" auth="${3:-}"
+  local pidfile="${PROXY_PID_DIR}/arcy_proxy_${proto}_${lport}.pid"
+  local logfile="${LOG_DIR}/proxy-${proto}-${lport}.log"
+  if listening_local "$lport"; then
+    log_info "Local ${proto} already listening at 127.0.0.1:${lport}"
+    return 0
+  fi
+  require_cmd gost
+  mkdir -p "${LOG_DIR}"
+  local cred=""; [[ -n "$auth" ]] && cred="${auth}@"
+  local cmd=""
+  case "$proto" in
+    socks) cmd="gost -L socks5://${cred}127.0.0.1:${lport}" ;;
+    http)  cmd="gost -L http://${cred}127.0.0.1:${lport}" ;;
+    *)     log_err "Unknown proto: $proto"; exit 1 ;;
+  esac
+  nohup bash -c "$cmd" >>"$logfile" 2>&1 &
+  echo $! > "$pidfile"
+  sleep 0.25
+  if listening_local "$lport"; then
+    log_ok "Spawned ${proto^^} proxy at 127.0.0.1:${lport} (PID $(cat "$pidfile"))"
+  else
+    log_warn "Tried to spawn ${proto} but port not listening; check ${logfile}"
+  fi
+}
+
+kill_proxy_if_spawned(){
+  local proto="$1" lport="$2"
+  local pidfile="${PROXY_PID_DIR}/arcy_proxy_${proto}_${lport}.pid"
+  if [[ -f "$pidfile" ]]; then
+    local pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+    rm -f "$pidfile"
+    log_ok "Stopped local ${proto^^} proxy on 127.0.0.1:${lport}"
+  fi
+}
+
+summary_box(){
+  local rport="$1" lport="$2" mode="$3" kind="$4"
+  box "Tunnel is ready" \
+"Public : ${C_BOLD}${SERVER}:${rport}${C_RESET}
+Local  : ${C_BOLD}127.0.0.1:${lport}${C_RESET}
+Kind   : ${C_BOLD}${kind}${C_RESET}
+Mode   : ${C_BOLD}${mode}${C_RESET}
+Rathole: ${C_BOLD}server ${SERVER}:${CONTROL_PORT}${C_RESET}"
+}
+
+open_tunnel(){
+  # args: kind lport rport daemon spawnflag auth
+  local kind="$1" lport="$2" rport="$3" daemon="$4" spawnflag="$5" auth="${6:-}"
+  local name="${NAME_PREFIX:-$DEFAULT_NAME_PREFIX}${rport}"
+  local cfg="$(cfg_path "$rport")"
+
+  hr
+  log_info "Ensuring service on VPS for ${C_BOLD}${rport}${C_RESET} ..."
+  ensure_service "$rport"
+  log_ok   "Service ${C_BOLD}${name}${C_RESET} present on VPS"
+  hr
+
+  # spawn local proxy if requested
+  if [[ "$spawnflag" == "1" ]]; then
+    case "$kind" in
+      HTTP)   spawn_proxy "http"  "$lport" "$auth" ;;
+      SOCKS5) spawn_proxy "socks" "$lport" "$auth" ;;
+      TCP)    : ;;
+    esac
+  fi
+
+  cat > "${cfg}" <<EOFCONF
+[client]
+remote_addr = "${SERVER}:${CONTROL_PORT}"
+default_token = "${TOKEN}"
+heartbeat_timeout = 0
+retry_interval = 1
+
+[client.services.${name}]
+local_addr = "127.0.0.1:${lport}"
+type = "tcp"
+token = "${TOKEN}"
+nodelay = true
+retry_interval = 1
+EOFCONF
+
+  if [[ "${daemon}" == "-d" ]]; then
+    mkdir -p "${LOG_DIR}"
+    nohup rathole -c "${cfg}" >>"${LOG_DIR}/${name}.log" 2>&1 &
+    log_ok "UP: ${SERVER}:${rport} -> 127.0.0.1:${lport}  (PID $!)"
+    summary_box "$rport" "$lport" "daemon" "$kind"
+    echo
+    log_info "Logs: ${LOG_DIR}/${name}.log"
+  else
+    cleanup_on_int(){
+      echo
+      log_warn "Ctrl+C — stopping client & closing ${SERVER}:${rport} ..."
+      pkill -f "${cfg}" >/dev/null 2>&1 || true
+      remove_service "$rport" || true
+      rm -f "${cfg}" || true
+      case "$kind" in
+        HTTP)   kill_proxy_if_spawned "http"  "$lport" ;;
+        SOCKS5) kill_proxy_if_spawned "socks" "$lport" ;;
+      esac
+      log_ok "Closed ${SERVER}:${rport}"
+      exit 130
+    }
+    trap cleanup_on_int INT
+
+    summary_box "$rport" "$lport" "foreground" "$kind"
+    echo
+    log_info "Press Ctrl+C to stop & close ${SERVER}:${rport}"
+    hr
+    rathole -c "${cfg}" || true
+    trap - INT
+  fi
+}
+
+# ============== MAIN ==============
+[[ $# -lt 1 ]] && { usage; exit 1; }
+
+# Ensure config and SSH options before anything else
+ensure_config
+build_ssh_opts
+
+# Base requirements
+require_cmd ssh
+require_cmd rathole
+
+cmd="${1}"; shift
+
+case "$cmd" in
+  setup)
+    setup_wizard
+    ;;
+
+  print-config)
+    echo "ARCY_HOME: $ARCY_HOME"
+    [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || echo "No config found"
+    ;;
+
+  tcp)
+    [[ $# -ge 1 ]] || { usage; exit 1; }
+    lport="$1"; shift
+    rport="${1:-$lport}"; [[ $# -ge 1 ]] && shift || true
+    daemon="${1:-}"
+
+    is_port "$lport" || { log_err "Invalid local_port: $lport"; exit 1; }
+    is_port "$rport" || { log_err "Invalid remote_port: $rport"; exit 1; }
+
+    open_tunnel "TCP" "$lport" "$rport" "$daemon" "0" ""
+    ;;
+
+  http|socks)
+    [[ $# -ge 1 ]] || { usage; exit 1; }
+    kind="${cmd^^}"; [[ "$kind" == "SOCKS" ]] && kind="SOCKS5"
+    lport="$1"; shift
+    rport="$lport"
+    if [[ $# -ge 1 && "$1" =~ ^[0-9]+$ ]]; then rport="$1"; shift; fi
+
+    daemon=""; spawn="0"; auth=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -d) daemon="-d";;
+        --spawn) spawn="1";;
+        --auth) shift; [[ $# -lt 1 ]] && { log_err "--auth requires 'user:pass'"; exit 1; }; auth="$1";;
+        --auth=*) auth="${1#*=}";;
+        *) log_warn "Unknown flag: $1";;
+      esac
+      shift || true
+    done
+
+    is_port "$lport" || { log_err "Invalid local_port: $lport"; exit 1; }
+    is_port "$rport" || { log_err "Invalid remote_port: $rport"; exit 1; }
+
+    open_tunnel "$kind" "$lport" "$rport" "$daemon" "$spawn" "$auth"
+    ;;
+
+  stop)
+    [[ $# -eq 1 ]] || { usage; exit 1; }
+    rport="$1"; is_port "$rport" || { log_err "Invalid port"; exit 1; }
+    pkill -f "$(cfg_path "$rport")" >/dev/null 2>&1 || true
+    log_ok "Stopped local client for ${SERVER}:${rport}"
+    ;;
+
+  down)
+    [[ $# -eq 1 ]] || { usage; exit 1; }
+    rport="$1"; is_port "$rport" || { log_err "Invalid port"; exit 1; }
+    kill_proxy_if_spawned "http"  "$rport" || true
+    kill_proxy_if_spawned "socks" "$rport" || true
+    pkill -f "$(cfg_path "$rport")" >/dev/null 2>&1 || true
+    remove_service "$rport" || true
+    rm -f "$(cfg_path "$rport")" || true
+    log_ok "Down: ${SERVER}:${rport} closed"
+    ;;
+
+  ls)
+    hr
+    log_info "Reading services on VPS ${SERVER} ..."
+    remote_cmd='awk -v RS="" '\''/\[server\.services\./{name=""; port=""; if (match($0, /\[server\.services\.([^]]+)\]/, a)) name=a[1]; if (match($0, /bind_addr *= *"[^:]+:([0-9]+)"/, b)) port=b[1]; if (name ~ /^dyn-/ && port!="") printf "%-20s %s\n", name, port; }'\'' /etc/rathole/server.toml'
+    out="$(ssh ${SSH_OPTS} "${SSH_USER}@${SERVER}" "${remote_cmd}" 2>/dev/null || true)"
+    if [[ -z "$out" ]]; then
+      log_warn "No dyn-* services found."
+    else
+      box "Active services on VPS" "$(echo -e "NAME                 PORT\n$out" | column -t)"
+    fi
+    ;;
+
+  status)
+    [[ $# -eq 1 ]] || { usage; exit 1; }
+    rport="$1"; is_port "$rport" || { log_err "Invalid port"; exit 1; }
+    pid="$(client_pid_by_cfg "$rport")"
+    local_s="$( [[ -n "$pid" ]] && echo "UP (PID $pid)" || echo "DOWN")"
+    vps_cmd="ss -lntp | grep -E \":"${rport}"\b\" || true"
+    vps_s="$(ssh ${SSH_OPTS} "${SSH_USER}@${SERVER}" "${vps_cmd}" 2>/dev/null || true)"
+    vps_pretty="DOWN"; [[ -n "$vps_s" ]] && vps_pretty="LISTEN"
+    box "Status ${SERVER}:${rport}" \
+"Local client : ${C_BOLD}${local_s}${C_RESET}
+VPS listener : ${C_BOLD}${vps_pretty}${C_RESET}"
+    ;;
+
+  logs)
+    log_info "Tailing Rathole logs on VPS (Ctrl+C to stop) ..."
+    ssh ${SSH_OPTS} "${SSH_USER}@${SERVER}" sudo journalctl -fu rathole -o cat
+    ;;
+
+  logclear)
+    log_info "Rotating & vacuuming journald ..."
+    ssh ${SSH_OPTS} "${SSH_USER}@${SERVER}" 'sudo journalctl --rotate && sudo journalctl --vacuum-time=1s'
+    log_ok "Done. Logs are clean."
+    ;;
+
+  *)
+    usage; exit 1;;
+esac
