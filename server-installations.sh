@@ -1,13 +1,3 @@
-# 1) Download rilis terbaru (pilih arsitektur kamu; contoh x86_64)
-sudo apt update && sudo apt install -y wget unzip
-wget https://github.com/rathole-org/rathole/releases/latest/download/rathole-x86_64-unknown-linux-gnu.zip
-unzip rathole-x86_64-unknown-linux-gnu.zip
-chmod +x rathole
-sudo mv rathole /usr/local/bin/
-
-# 2) Siapkan folder config
-sudo mkdir -p /etc/rathole
-
 sudo tee /etc/systemd/system/rathole.service >/dev/null <<'EOF'
 [Unit]
 Description=Rathole Server
