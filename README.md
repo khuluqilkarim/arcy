@@ -1,7 +1,3 @@
-Here’s a tightened, minimal, and polished README you can drop in as `README.md`.
-
----
-
 # arcy — self-hosted reverse tunnel powered by rathole
 
 Expose local services to the internet securely with a **single command**.
@@ -164,10 +160,6 @@ arcy logclear     # rotate/vacuum server journal (VPS)
 * **No `dyn-*` listed** → verify SSH access and check server logs with `arcy logs`.
 
 ---
-
-## License
-
-Add your license (e.g., MIT/Apache-2.0) and a `LICENSE` file.
 
 **Credits**: built on top of the excellent [rathole].
 
