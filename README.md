@@ -1,6 +1,8 @@
-# arcy — pretty CLI for dynamic Rathole tunnels
+# arcy — self‑hosted reverse tunnel  powered by rathole
+Expose local services to the internet securely with a **single command**. `arcy` is a thin wrapper + conventions around [rathole] to make ephemeral TCP tunnels easy for red/purple‑team workflows and day‑to‑day ops.
 
-Tiny wrapper around **rathole** to open dynamic reverse tunnels fast, safely, and with nice ops ergonomics.
+> **Why arcy?** Minimal attack surface, token‑gated, auditable, and fast to spin up/tear down (think: *open → test → close*). Designed to pair well with C2/SOCKS use cases (e.g., Sliver), internal dashboards, and temporary SSH access.
+
 
 ---
 
