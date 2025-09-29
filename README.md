@@ -1,42 +1,28 @@
-# arcy — self‑hosted reverse tunnel  powered by rathole
-Expose local services to the internet securely with a **single command**. `arcy` is a thin wrapper + conventions around [rathole] to make ephemeral TCP tunnels easy for red/purple‑team workflows and day‑to‑day ops.
-
-> **Why arcy?** Minimal attack surface, token‑gated, auditable, and fast to spin up/tear down (think: *open → test → close*). Designed to pair well with C2/SOCKS use cases (e.g., Sliver), internal dashboards, and temporary SSH access.
-
+Here’s a tightened, minimal, and polished README you can drop in as `README.md`.
 
 ---
 
-## Why arcy
+# arcy — self-hosted reverse tunnel powered by rathole
 
-* One-liners for **TCP / HTTP / SOCKS5** tunnels
-* **Dynamic services** on the VPS (`dyn-*`)
-* Built-in ops: `ls`, `status`, `logs`, `down`
-* Optional local proxy **spawn** with `--auth`
+Expose local services to the internet securely with a **single command**.
+**arcy** is a thin wrapper around [rathole] that makes ephemeral TCP/HTTP/SOCKS tunnels painless for red/purple-team workflows and day-to-day ops.
 
-> Security tip: always protect spawned HTTP/SOCKS proxies with `--auth user:pass`.
+> **Why arcy?** Minimal surface, token-gated, auditable, and fast to spin up/tear down (*open → test → close*). Plays nicely with C2/SOCKS (e.g., Sliver), internal dashboards, and temporary SSH access.
 
 ---
 
 ## Requirements
 
-* A VPS with a public IPv4, TCP **2333** open
+* A VPS with public IPv4 (TCP **2333** open)
 * `rathole` installed on client and server
 * SSH access to the VPS
-* Linux/macOS/WSL for the client
+* Linux/macOS/WSL as the client environment
 
 ---
 
 ## Quick Start
 
-**Server (VPS)**
-
-```bash
-wget https://raw.githubusercontent.com/khuluqilkarim/arcy/refs/heads/main/server-installations.sh
-chmod +x server-installations.sh
-./server-installations.sh
-```
-
-**Client**
+### 1) Install rathole (client & server)
 
 ```bash
 sudo apt update && sudo apt install -y wget unzip
@@ -46,7 +32,31 @@ chmod +x rathole && sudo mv rathole /usr/local/bin/
 sudo mkdir -p /etc/rathole
 ```
 
-Create `/etc/rathole/client.toml`:
+### 2) Install arcy
+
+**Server**
+
+```bash
+git clone https://github.com/khuluqilkarim/arcy.git
+cd arcy
+chmod +x server-installations.sh
+```
+
+**Client**
+
+```bash
+git clone https://github.com/khuluqilkarim/arcy.git
+cd arcy
+chmod +x arcy
+sed -i 's/\r$//' arcy
+sudo cp arcy /usr/local/bin/arcy   # put arcy in PATH
+```
+
+---
+
+## Configure
+
+### Client (`/etc/rathole/client.toml`)
 
 ```toml
 [client]
@@ -59,17 +69,28 @@ type = "tcp"
 token = "<RANDOM-TOKEN>"
 ```
 
-(Optional) put `arcy` in PATH:
-
-```bash
-sudo install -m 0755 arcy /usr/local/bin/arcy
-```
-
-Run setup:
+### Client first-run wizard (optional)
 
 ```bash
 arcy setup
+# Copy the generated token and use it on the server.
 ```
+
+### Server: set the token
+
+**Using helper script**
+
+```bash
+sudo ./server-installations.sh <YOUR_TOKEN>
+```
+
+**Or manually**
+
+```bash
+echo "<YOUR_TOKEN>" | sudo tee /etc/rathole/token >/dev/null
+```
+
+> The client’s `default_token` (or per-service `token`) **must match** the server.
 
 ---
 
@@ -82,7 +103,6 @@ arcy socks <local_port> [remote_port] [-d] [--spawn] [--auth user:pass]
 
 arcy stop <remote_port>
 arcy down <remote_port>
-arcy ls
 arcy status <remote_port>
 arcy logs
 arcy logclear
@@ -93,19 +113,19 @@ arcy print-config
 
 **Common flags**
 
-* `-d`          — run in background
-* `--spawn`     — spawn local HTTP/SOCKS proxy on `<local_port>`
-* `--auth u:p`  — basic auth for the spawned proxy
+* `-d` — run in background
+* `--spawn` — spawn local HTTP/SOCKS proxy on `<local_port>`
+* `--auth u:p` — basic auth for spawned proxy (**recommended**)
 
 ---
 
 ## Examples
 
 ```bash
-# Expose local web on 8080 to remote 443, spawn local HTTP proxy with auth
+# Expose local web on 8080 to remote 443; spawn local HTTP proxy with auth
 arcy http 8080 443 -d --spawn --auth user:pass
 
-# Start a SOCKS5 proxy on 1080; remote port auto-assign
+# Start a SOCKS5 proxy on 1080 (remote port auto-assigned)
 arcy socks 1080 --spawn --auth proxy:secret
 
 # Raw TCP for DB (local 5432 -> remote 25432)
@@ -115,49 +135,33 @@ arcy tcp 5432 25432 -d
 Ops:
 
 ```bash
-arcy ls                   # list dyn-* services
-arcy status 443           # check local/server health for port 443
-arcy stop 443             # stop local client only
-arcy down 443             # stop client + remove VPS service
-arcy logs                 # tail rathole server logs
-arcy logclear             # rotate/vacuum server journal
+arcy status 443   # local/server health for remote port 443
+arcy stop 443     # stop local client only
+arcy down 443     # stop client + remove VPS service
+arcy logs         # tail rathole server logs (VPS)
+arcy logclear     # rotate/vacuum server journal (VPS)
 ```
-
----
-
-## Minimal Server Config (manual)
-
-`/etc/rathole/server.toml`
-
-```toml
-[server]
-bind_addr = "0.0.0.0:2333"
-default_token = "<RANDOM-TOKEN>"
-
-[server.services.rshell]
-type = "tcp"
-bind_addr = "0.0.0.0:4444"
-token = "<RANDOM-TOKEN>"
-```
-
-> Match `default_token` (or per-service `token`) with the client.
 
 ---
 
 ## Security
 
-* Use **strong, unique tokens**; never commit them.
-* Always set `--auth` for HTTP/SOCKS proxies.
+* Use **strong, unique tokens** and never commit them.
+* Always protect HTTP/SOCKS proxies with `--auth`.
 * Restrict exposed ports via firewall/security groups.
-* Rotate server logs periodically (`arcy logclear`).
+* Rotate server logs regularly (`arcy logclear`).
 
 ---
 
 ## Troubleshooting (quick)
 
-* **Port already in use**: choose another local port or free it (`lsof -iTCP:<port> -sTCP:LISTEN`).
-* **Cannot reach `:2333`**: open the port on VPS; verify `server.toml` `bind_addr`.
-* **No `dyn-*` listed**: check SSH access and server logs (`arcy logs`).
+* **Port already in use** → choose another local port or free it:
+
+  ```bash
+  lsof -iTCP:<port> -sTCP:LISTEN
+  ```
+* **Cannot reach `:2333`** → open the port on the VPS; check `server.toml` `bind_addr`.
+* **No `dyn-*` listed** → verify SSH access and check server logs with `arcy logs`.
 
 ---
 
@@ -165,4 +169,6 @@ token = "<RANDOM-TOKEN>"
 
 Add your license (e.g., MIT/Apache-2.0) and a `LICENSE` file.
 
-**Credits**: built on top of the excellent [rathole](https://github.com/rathole-org/rathole).
+**Credits**: built on top of the excellent [rathole].
+
+[rathole]: https://github.com/rathole-org/rathole
