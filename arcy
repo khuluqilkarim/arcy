@@ -56,7 +56,6 @@ ${C_BOLD}Usage${C_RESET}
 
   ${C_BLU}arcy stop <remote_port>${C_RESET}                       stop local client only
   ${C_BLU}arcy down <remote_port>${C_RESET}                       stop client + remove service on VPS
-  ${C_BLU}arcy ls${C_RESET}                                       list active dyn-* services on VPS
   ${C_BLU}arcy status <remote_port>${C_RESET}                     show local/VPS status for a port
   ${C_BLU}arcy logs${C_RESET}                                     tail Rathole server logs (VPS)
   ${C_BLU}arcy logclear${C_RESET}                                 rotate+vacuum journal (VPS)
@@ -406,18 +405,6 @@ case "$cmd" in
     log_ok "Down: ${SERVER}:${rport} closed"
     ;;
 
-  ls)
-    hr
-    log_info "Reading services on VPS ${SERVER} ..."
-    remote_cmd='awk -v RS="" '\''/\[server\.services\./{name=""; port=""; if (match($0, /\[server\.services\.([^]]+)\]/, a)) name=a[1]; if (match($0, /bind_addr *= *"[^:]+:([0-9]+)"/, b)) port=b[1]; if (name ~ /^dyn-/ && port!="") printf "%-20s %s\n", name, port; }'\'' /etc/rathole/server.toml'
-    out="$(ssh ${SSH_OPTS} "${SSH_USER}@${SERVER}" "${remote_cmd}" 2>/dev/null || true)"
-    if [[ -z "$out" ]]; then
-      log_warn "No dyn-* services found."
-    else
-      box "Active services on VPS" "$(echo -e "NAME                 PORT\n$out" | column -t)"
-    fi
-    ;;
-
   status)
     [[ $# -eq 1 ]] || { usage; exit 1; }
     rport="$1"; is_port "$rport" || { log_err "Invalid port"; exit 1; }
@@ -446,3 +433,4 @@ VPS listener : ${C_BOLD}${vps_pretty}${C_RESET}"
     usage; exit 1;;
 
 esac
+
