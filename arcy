@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # ==================== CONSTANTS/DEFAULTS ====================
-DEFAULT_SERVER="13.218.137.84"
+DEFAULT_SERVER="<VPS-SERVER-IP>"
 DEFAULT_SSH_USER="ubuntu"
 DEFAULT_CONTROL_PORT=2333
 DEFAULT_TOKEN=""                         # will be auto-generated if empty
@@ -444,4 +444,5 @@ VPS listener : ${C_BOLD}${vps_pretty}${C_RESET}"
 
   *)
     usage; exit 1;;
+
 esac
